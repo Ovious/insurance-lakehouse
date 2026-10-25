@@ -1,0 +1,285 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC ## Environment setup
+
+# COMMAND ----------
+
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from pyspark.sql.types import (
+    StructType, StructField,
+    StringType, DoubleType, TimestampType
+)
+from datetime import datetime
+
+catalog = "insurance_company"
+
+spark.sql(f"USE CATALOG {catalog}")
+spark.sql("CREATE SCHEMA IF NOT EXISTS insurance_silver")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Test data preparations
+
+# COMMAND ----------
+
+claims_data = [
+    ("CLM001", "POL001", 1500.0, "OPEN",    datetime(2026, 10, 20, 10, 0)),
+    ("CLM002", "POL002", 2500.0, "CLOSED",  datetime(2026, 10, 20, 11, 0)),
+    ("CLM003", "POL001",  750.0, "OPEN",    datetime(2026, 10, 21,  9, 0)),
+    ("CLM004", "POL003", 3200.0, "PENDING", datetime(2026, 10, 21, 12, 0)),
+    ("CLM005", "POL004", 1000.0, "OPEN",    datetime(2026, 10, 22,  8, 0)),
+
+    # Updated versions of existing claims
+    ("CLM001", "POL001", 1800.0, "PENDING", datetime(2026, 10, 22, 14, 0)),
+    ("CLM003", "POL001",  900.0, "CLOSED",  datetime(2026, 10, 23, 10, 0)),
+
+    # Invalid policy reference
+    ("CLM006", "POL999", 1200.0, "OPEN", datetime(2026, 10, 23, 11, 0)),
+
+    # Some invalid records
+    ("CLM001", "POL001", -1800.0, "PENDING", datetime(2026, 10, 22, 9, 0)),
+    ("CLM005", "POL004", 900.0, "CANC", datetime(2026, 10, 21, 19, 0))
+]
+
+claims_schema = StructType([
+    StructField("claim_id", StringType(), True),
+    StructField("policy_id", StringType(), True),
+    StructField("claim_amount", DoubleType(), True),
+    StructField("status", StringType(), True),
+    StructField("updated_at", TimestampType(), True)
+])
+
+claims_df = spark.createDataFrame(
+    claims_data,
+    schema=claims_schema
+)
+
+display(claims_df)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Policies data
+
+# COMMAND ----------
+
+policies_data = [
+    ("POL001", "CUS001", "CAR",    "ACTIVE"),
+    ("POL002", "CUS002", "HOME",   "ACTIVE"),
+    ("POL003", "CUS003", "LIFE",   "EXPIRED"),
+    ("POL004", "CUS004", "TRAVEL", "ACTIVE"),
+    ("POL005", "CUS005", "CAR",    "ACTIVE")
+]
+
+policies_columns = [
+    "policy_id",
+    "customer_id",
+    "policy_type",
+    "policy_status"
+]
+
+policies_df = spark.createDataFrame(
+    policies_data,
+    policies_columns
+)
+
+# Inserting policies data into table insurance_company.insurance_bronze.policies
+
+(
+    policies_df.write
+        .format("delta")
+        .mode("overwrite")
+        .saveAsTable("insurance_company.insurance_bronze.policies")
+)
+
+
+display(policies_df)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Simulation #1 - simple test for join, left join and anti-join
+
+# COMMAND ----------
+
+# Inner join
+
+df_inner_1 = claims_df.join(
+    policies_df,
+    on="policy_id",
+    how="inner"
+)
+
+# display(df_inner_1)
+# Left join
+
+df_left_1 = claims_df.join(
+    policies_df,
+    on="policy_id",
+    how="left"
+)
+
+display(df_left_1)
+
+df_left_anti_1 = claims_df.join(
+    policies_df,
+    on="policy_id",
+    how="left_anti"
+)
+
+# display(df_left_anti_1)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Simulation #2 - simple test for window functions
+
+# COMMAND ----------
+
+window_spec = Window \
+    .partitionBy("claim_id") \
+    .orderBy(F.col("updated_at").desc())
+
+ranked_df = claims_df.withColumn(
+    "row_num",
+    F.row_number().over(window_spec)
+)
+
+display(ranked_df)
+
+# COMMAND ----------
+
+latest_claims_df = ranked_df.filter(
+    F.col("row_num") == 1
+).drop("row_num")
+
+display(latest_claims_df)
+
+# COMMAND ----------
+
+# MAGIC
+# MAGIC %md
+# MAGIC ## Simulation #3 - Data Quality and Dedup testing
+# MAGIC goal is to have 3 dataframes, "valid_claims_df", "invalid_claims_df" and "latest_valid_claims_df"
+
+# COMMAND ----------
+
+# valid_claims_df
+
+valid_claims_df = claims_df.filter( 
+    (F.col("claim_amount") > 0) &
+    (F.col("status").isin("PENDING", "CLOSED", "OPEN")) &
+    (F.col("claim_id").isNotNull() & F.col("policy_id").isNotNull())
+)
+
+# display(valid_claims_df)
+
+# invalid_claims_df
+
+validation_condition = (
+    (F.col("claim_amount") > 0) &
+    (F.col("status").isin("PENDING", "CLOSED", "OPEN")) &
+    (F.col("claim_id").isNotNull()) &
+    (F.col("policy_id").isNotNull())
+)
+
+invalid_claims_df = claims_df.filter(
+    ~F.coalesce(validation_condition, F.lit(False))
+)
+
+# display(invalid_claims_df)
+
+# A control point for number of valid and invalid cases
+
+assert (
+    claims_df.count()
+    == valid_claims_df.count() + invalid_claims_df.count()
+)
+
+# latest_valid_claims_df
+
+window_spec = Window \
+    .partitionBy("claim_id") \
+    .orderBy(F.col("updated_at").desc())
+
+ranked_df = valid_claims_df.withColumn(
+    "row_num",
+    F.row_number().over(window_spec)
+)
+
+latest_valid_claims_df = ranked_df.filter(
+    F.col("row_num") == 1
+).drop("row_num")
+
+display(latest_valid_claims_df)
+
+
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Simulation #4 - Silver operations
+# MAGIC
+# MAGIC #### At this level the data should be used directly from source batches under insurance_copmany Catalog, treating previously defined dataframes as tests and simulations
+# MAGIC
+# MAGIC Target : insurance_company.insurance_silver.claims_enriched
+# MAGIC Source : Bronze table filled with new batch of data
+
+# COMMAND ----------
+
+from pyspark.sql.window import Window
+
+bronze_df = spark.table(
+    "insurance_company.insurance_bronze.claims"
+)
+
+
+window_spec = (
+    Window
+    .partitionBy("claim_id")
+    .orderBy(
+        F.col("source_event_timestamp").desc(),
+        F.col("ingestion_timestamp").desc()
+    )
+)
+
+latest_claims_df = (
+    bronze_df
+    .withColumn(
+        "row_num",
+        F.row_number().over(window_spec)
+    )
+    .filter(F.col("row_num") == 1)
+    .drop("row_num")
+)
+
+enriched_df = latest_claims_df.join(
+    policies_df,
+    on="policy_id",
+    how="inner"
+).filter(
+    (F.col("claim_amount") > 0.0 ) &
+    (F.col("status").isin(["PENDING", "CLOSED", "OPEN"])) &
+    (F.col("claim_id").isNotNull()) &
+    (F.col("policy_id").isNotNull())
+)
+
+silver_df = enriched_df.select(
+    "claim_id",
+    "policy_id",
+    "customer_id",
+    "policy_type",
+    "claim_amount",
+    "status",
+    "source_event_timestamp"
+)
+
+(
+    silver_df.write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .saveAsTable("insurance_company.insurance_silver.claims_enriched")
+)
